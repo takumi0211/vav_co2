@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils as nn_utils
 import torch.optim as optim
+import warnings
 
 # ---------------------------------------------------------------------------
 # システムシミュレータ側のユーティリティをインポートし、RL環境で再利用
@@ -649,8 +650,12 @@ def _load_weather_profiles(weather_dir: Path) -> List[tuple[Path, tuple[np.ndarr
 
     profiles: List[tuple[Path, tuple[np.ndarray, np.ndarray, np.ndarray]]] = []
     for path in sorted(weather_dir.glob("*.csv")):
-        df = pd.read_csv(path)
-        profiles.append((path, _prepare_weather_profile(df, path)))
+        try:
+            df = pd.read_csv(path)
+            profiles.append((path, _prepare_weather_profile(df, path)))
+        except Exception as exc:  # Skip non-weather helper files (e.g., solar CSV)
+            warnings.warn(f"Skipping weather file {path}: {exc}", RuntimeWarning)
+            continue
     if not profiles:
         raise FileNotFoundError(f"No weather CSV files found in {weather_dir}")
     return profiles
