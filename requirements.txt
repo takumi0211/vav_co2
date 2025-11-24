@@ -1,0 +1,12 @@
+numpy
+pandas
+matplotlib
+torch
+scipy
+sklearn
+seaborn
+tqdm
+numba
+openai
+python-dotenv
+ollama
