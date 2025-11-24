@@ -70,6 +70,46 @@ OUTDOOR_RHS = _outdoor_df["relative_humidity"].to_numpy()
 # 室内空気質評価用の代表外気CO2濃度[ppm]
 OUTDOOR_CO2_PPM = 420.0
 
+# ---------------------------------------------------------------------------
+# 簡易日射取得プロファイル（将来CSV差し替え前提）
+# ---------------------------------------------------------------------------
+SOLAR_GAIN_PATH = WEATHER_DATA_DIR / "solar_gain_default.csv"
+
+
+def _ensure_default_solar_profile(path: Path) -> None:
+    """Create a simple bell-shaped solar gain profile if none exists."""
+
+    if path.exists():
+        return
+
+    minutes = np.arange(0, 24 * 60 + 1, 10)  # 10-minute resolution
+    # Peak 600 W at noon, zero at 6:00–18:00 edges with smooth sine
+    sunrise = 6 * 60
+    sunset = 18 * 60
+    phi = np.zeros_like(minutes, dtype=float)
+    span = sunset - sunrise
+    mid = (sunrise + sunset) / 2
+    for idx, m in enumerate(minutes):
+        if sunrise <= m <= sunset:
+            phase = (m - sunrise) / span
+            phi[idx] = 600.0 * np.sin(np.pi * phase)  # smooth bell
+    df = pd.DataFrame({"minutes": minutes, "phi_sol_w": phi})
+    df.to_csv(path, index=False)
+
+
+_ensure_default_solar_profile(SOLAR_GAIN_PATH)
+_solar_df = pd.read_csv(SOLAR_GAIN_PATH).sort_values("minutes").reset_index(drop=True)
+if "minutes" not in _solar_df.columns or "phi_sol_w" not in _solar_df.columns:
+    raise ValueError("Solar gain CSV must have columns: minutes, phi_sol_w")
+SOLAR_MINUTES = _solar_df["minutes"].to_numpy()
+SOLAR_GAINS = _solar_df["phi_sol_w"].to_numpy()
+if SOLAR_MINUTES[0] > 0:
+    first_row = _solar_df.iloc[0].copy()
+    first_row["minutes"] = 0
+    _solar_df = pd.concat([pd.DataFrame([first_row]), _solar_df], ignore_index=True)
+    SOLAR_MINUTES = _solar_df["minutes"].to_numpy()
+    SOLAR_GAINS = _solar_df["phi_sol_w"].to_numpy()
+
 # CLI環境で描画するため、GUI非依存のバックエンドへ切り替え
 plt.switch_backend("Agg")
 
@@ -82,6 +122,24 @@ RHO_WATER = 998.0  # kg/m3, approximate density of chilled water
 DEFAULT_CHILLER_COP = 4.0
 DEFAULT_INITIAL_REL_HUM = 50.0  # [%] initial relative humidity for all zones
 OCCUPANCY_CUTOFF_HOUR = 18  # Occupants leave after 18:00
+
+# 5R2C base constants (Table 2)
+VOLUME_5R2C = 250.0
+A_FLOOR = VOLUME_5R2C / 2.7
+A_WIN = A_FLOOR * 0.15
+A_WALL = 38.0
+A_IN = 288.9
+U_WALL = 1.015  # W/m2K
+U_WIN = 2.0  # W/m2K
+C_M = 7_407_407.0      # J/K
+
+
+# Derived 5R2C conductances
+H_EM = U_WALL * A_WALL
+H_W = U_WIN * A_WIN
+H_MS = 9.1 * 2.5 * A_FLOOR
+H_IS = 3.45 * A_IN
+H_VE_MIN = 0.0001  # W/K baseline ventilation conductance
 
 
 def occupancy_with_cutoff(
@@ -292,7 +350,7 @@ _DEFAULT_ZONE_PARAMETER_ROWS: Tuple[Dict[str, float | str], ...] = (
         "name": "Zone 1",  # ゾーン名
         "thermal_cap": 3.2e6,  # 熱容量 [J/K] - ゾーンの蓄熱容量
         "ua_env": 170.0,  # 外壁熱貫流率 [W/K] - 外気との熱伝達係数
-        "infil_mdot": 0.018,  # 外気侵入量 [kg/s] - 隙間風などによる外気流入
+        "infil_mdot": 0.009,  # 外気侵入量 [kg/s] - 隙間風などによる外気流入（半減）
         "flow_min": 0.08,  # 最小風量 [kg/s] - VAVダンパーの最小開度時の風量
         "flow_max": 0.42,  # 最大風量 [kg/s] - VAVダンパーの最大開度時の風量
         "initial_temp": 28.0,  # 初期温度 [°C] - シミュレーション開始時の室温
@@ -303,7 +361,7 @@ _DEFAULT_ZONE_PARAMETER_ROWS: Tuple[Dict[str, float | str], ...] = (
         "name": "Zone 2",
         "thermal_cap": 2.8e6,
         "ua_env": 150.0,
-        "infil_mdot": 0.016,
+        "infil_mdot": 0.008,
         "flow_min": 0.07,
         "flow_max": 0.36, # 設計風量 [kg/s]
         "initial_temp": 27.5,
@@ -314,7 +372,7 @@ _DEFAULT_ZONE_PARAMETER_ROWS: Tuple[Dict[str, float | str], ...] = (
         "name": "Zone 3",
         "thermal_cap": 2.6e6,
         "ua_env": 145.0,
-        "infil_mdot": 0.015,
+        "infil_mdot": 0.0075,
         "flow_min": 0.065,
         "flow_max": 0.34, # 設計風量 [kg/s]
         "initial_temp": 27.2,
@@ -325,7 +383,7 @@ _DEFAULT_ZONE_PARAMETER_ROWS: Tuple[Dict[str, float | str], ...] = (
         "name": "Zone 4",
         "thermal_cap": 3.0e6,
         "ua_env": 160.0,
-        "infil_mdot": 0.017,
+        "infil_mdot": 0.0085,
         "flow_min": 0.055,
         "flow_max": 0.32, # 設計風量 [kg/s]
         "initial_temp": 28.3,
@@ -358,7 +416,7 @@ class ZoneConfig:
     damper_min: float = 0.05
     leakage_m3_min: float = 0.02
     terminal_dp_pa: float = 0.0
-    volume_m3: float = 250.0
+    volume_m3: float = VOLUME_5R2C
     initial_co2_ppm: float = 420.0
     initial_rh: float = 50.0  # 初期相対湿度 [%]
     day_occupants: float = 6.0
@@ -760,6 +818,14 @@ def outdoor_absolute_humidity(ts: datetime) -> float:
     return float(pv.tdb_rh2w(outdoor_temperature(ts), outdoor_relative_humidity(ts)))
 
 
+def solar_gain(ts: datetime) -> float:
+    """指定時刻の全日射取得 Φ_sol [W] を線形補間で返す。全ゾーン共通プロファイル。"""
+
+    minute_of_day = ts.hour * 60 + ts.minute
+    minute_of_day = np.clip(minute_of_day, SOLAR_MINUTES[0], SOLAR_MINUTES[-1])
+    return float(np.clip(np.interp(minute_of_day, SOLAR_MINUTES, SOLAR_GAINS), 0.0, None))
+
+
 def run_simulation(
     start: datetime,
     minutes: int,
@@ -788,8 +854,8 @@ def run_simulation(
     supply_air_setpoint: float = 16.0,
     setpoint: float = 26.0,
     action_callback: Optional[Callable[[datetime, np.ndarray, np.ndarray, np.ndarray], HVACActions]] = None,
-    zone_pid_kp: float = 0.6,
-    zone_pid_ti: float = 25.0,
+    zone_pid_kp: float = 0.06,
+    zone_pid_ti: float = 2.50,
     zone_pid_t_reset: int = 30,
     zone_pid_initial: float = 0.35,
     zone_pid_t_step: int = 1,
@@ -1278,7 +1344,10 @@ def run_simulation(
         return best_hi[1:]
 
     # --- ゾーン初期状態（温度・CO2・湿度）をベクトル化して状態変数に格納 ---
-    zone_temps = np.array([zone.initial_temp for zone in zones], dtype=float)
+    # 5R2C states: air (=what rest of code sees), mass, and derived surface temperature
+    zone_temps = np.array([zone.initial_temp for zone in zones], dtype=float)  # T_air
+    zone_t_mass = np.array([zone.initial_temp for zone in zones], dtype=float)  # T_m
+    zone_t_surface = np.array([zone.initial_temp for zone in zones], dtype=float)  # T_s
     zone_co2_ppm = np.array([zone.initial_co2_ppm for zone in zones], dtype=float)
     zone_rh = np.array([zone.initial_rh for zone in zones], dtype=float)  # ゾーン相対湿度
     zone_abs_hum = np.array([pv.tdb_rh2w(zone.initial_temp, zone.initial_rh) for zone in zones], dtype=float)  # ゾーン絶対湿度
@@ -1712,6 +1781,8 @@ def run_simulation(
         fan_dp_pa = float(fan.dp)
 
         next_zone_temps = zone_temps.copy()
+        next_zone_t_mass = zone_t_mass.copy()
+        next_zone_t_surface = zone_t_surface.copy()
         next_zone_co2_ppm = zone_co2_ppm.copy()
         next_zone_abs_hum = zone_abs_hum.copy()
         next_zone_rh = zone_rh.copy()
@@ -1743,16 +1814,67 @@ def run_simulation(
             else:
                 last_supply_temp = float(supply_temp)
 
+        phi_sol_total = solar_gain(current_time)
+
         for idx, zone in enumerate(zones):
             mass_flow = zone_flows[idx]
             infil_flow = zone.infil_mdot
-            # 外皮・すきま風・供給空気・内部発熱を足し合わせて顕熱バランスを解く
-            q_env = zone.ua_env * (outdoor_temp - zone_temps[idx])
-            q_inf = infil_flow * CP_AIR * (outdoor_temp - zone_temps[idx])
-            q_supply = mass_flow * CP_AIR * (effective_supply_temp - zone_temps[idx])
-            q_total = q_env + q_inf + internal_gains[idx] + q_supply
-            delta_t = (q_total * timestep_s) / zone.thermal_cap
-            next_zone_temps[idx] = zone_temps[idx] + delta_t
+            phi_int = internal_gains[idx]
+            # ---- Gain partitioning (Eq. B.7–B.9) ----
+            shared_gain = 0.5 * phi_int + phi_sol_total
+            phi_ia = 0.5 * phi_int
+            phi_m = (2.5 * A_FLOOR / A_IN) * shared_gain
+            phi_st = (1.0 - (2.5 * A_FLOOR) / A_IN - H_W / (9.1 * A_IN)) * shared_gain
+
+            # ---- Conductances and capacities ----
+            h_ve_dynamic = H_VE_MIN + CP_AIR * (mass_flow + infil_flow)
+            c_air = max(zone.volume_m3 * RHO_AIR * CP_AIR, 1e-9)
+
+            # ---- Surface node (algebraic) ----
+            denom_surface = H_MS + H_IS + H_W
+            if denom_surface > 1e-9:
+                ts = (
+                    H_MS * zone_t_mass[idx]
+                    + H_IS * zone_temps[idx]
+                    + H_W * outdoor_temp
+                    + phi_st
+                ) / denom_surface
+            else:
+                ts = zone_t_surface[idx]
+
+            # ---- Mass node ODE ----
+            dT_m = (
+                H_EM * (outdoor_temp - zone_t_mass[idx])
+                + H_MS * (ts - zone_t_mass[idx])
+                + phi_m
+            ) / C_M
+            next_zone_t_mass[idx] = zone_t_mass[idx] + dT_m * timestep_s
+
+            # ---- Air node ODE ----
+            t_ve_mix = (
+                H_VE_MIN * outdoor_temp
+                + CP_AIR * mass_flow * effective_supply_temp
+                + CP_AIR * infil_flow * outdoor_temp
+            ) / max(h_ve_dynamic, 1e-9)
+
+            dT_air = (
+                H_IS * (ts - zone_temps[idx])
+                + h_ve_dynamic * (t_ve_mix - zone_temps[idx])
+                + phi_ia
+            ) / c_air
+
+            next_zone_temps[idx] = zone_temps[idx] + dT_air * timestep_s
+
+            # ---- Update surface with latest states for reporting ----
+            if denom_surface > 1e-9:
+                next_zone_t_surface[idx] = (
+                    H_MS * next_zone_t_mass[idx]
+                    + H_IS * next_zone_temps[idx]
+                    + H_W * outdoor_temp
+                    + phi_st
+                ) / denom_surface
+            else:
+                next_zone_t_surface[idx] = ts
 
             zone_volume = max(zone.volume_m3, 1e-6)
             supply_vol_flow = mass_flow / RHO_AIR
@@ -1792,6 +1914,8 @@ def run_simulation(
             next_zone_rh[idx] = float(np.clip(next_zone_rh[idx], 0.0, 100.0))
 
         zone_temps = next_zone_temps
+        zone_t_mass = next_zone_t_mass
+        zone_t_surface = next_zone_t_surface
         zone_co2_ppm = next_zone_co2_ppm
         zone_abs_hum = next_zone_abs_hum
         zone_rh = next_zone_rh
@@ -2118,8 +2242,8 @@ def main() -> None:
     # 上記辞書に共通パラメータをまとめ、複数パターンを試しやすくする
 
     # --- 今回検証するゾーンPIDゲインを設定 ---
-    selected_kp = 0.6
-    selected_ti = 25.0
+    selected_kp = 0.03
+    selected_ti = 150
 
     print(
         f"Running simulation with fixed zone PID -> kp={selected_kp:.3f}, ti={selected_ti:.1f}"
