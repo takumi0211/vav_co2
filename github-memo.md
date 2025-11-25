@@ -3,5 +3,5 @@ git reset --hard origin/main
 git clean -fd
 
 git add -A
-git commit -m "before trim & respond"
+git commit -m "change to 90%"
 git push origin main

@@ -862,7 +862,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm-model",
         type=str,
-        default="gpt-5.1",
+        default="gpt-5",
         help="Model name for the LLM-based controller.",
     )
     return parser.parse_args()

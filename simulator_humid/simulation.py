@@ -836,12 +836,12 @@ def run_simulation(
     coil_ua: float = 3500.0,
     coil_dp_pa: float = 260.0,
     coil_bypass_factor: float = 0.1,
-    oa_frac_min: float = 0.35,
+    oa_frac_min: float = 0.4,
     oa_flow_min: float = 0.05,
     fan_nominal_flow_m3_min: float = 100.0,
     static_pressure_limit: float = 800.0,
-    mod_sp_floor: float = 200.0,
-    mod_sp_ceiling: float = 400.0,
+    mod_sp_floor: float = 250.0,
+    mod_sp_ceiling: float = 700.0,
     default_fan_inv: float = 0.6,
     chw_pump_head_pa: float = 80000.0,
     chw_pump_efficiency: float = 0.8,
@@ -1503,7 +1503,7 @@ def run_simulation(
                 sp_ceiling = float(np.clip(mod_sp_ceiling, sp_floor, static_pressure_limit))
                 if sp_ceiling <= sp_floor + 1.0:
                     sp_ceiling = sp_floor
-                mod_norm = float(np.clip((mod - 0.55) / (0.90 - 0.55), 0.0, 1.0))
+                mod_norm = float(np.clip((mod - 0.85) / (0.95 - 0.85), 0.0, 1.0))
                 sp_target = sp_floor + (sp_ceiling - sp_floor) * mod_norm
 
                 (
@@ -2232,7 +2232,7 @@ def main() -> None:
         coil_approach=1.0,
         coil_ua=3500.0,
         coil_bypass_factor=0.1,
-        default_fan_inv=0.95,
+        default_fan_inv=0.8,
         static_pressure_limit=900.0,
         setpoint=setpoint,
         zone_pid_t_reset=30,
