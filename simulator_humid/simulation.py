@@ -842,6 +842,18 @@ def run_simulation(
     static_pressure_limit: float = 800.0,
     mod_sp_floor: float = 250.0,
     mod_sp_ceiling: float = 700.0,
+    # --- ASHRAE G36 Trim & Respond parameters ---
+    use_trim_respond: bool = True,
+    tr_initial_sp: Optional[float] = None,
+    tr_min_sp: Optional[float] = None,
+    tr_max_sp: Optional[float] = None,
+    tr_trim_pa: float = -15.0,
+    tr_respond_pa: float = 25.0,
+    tr_max_step_pa: float = 75.0,
+    tr_sample_s: int = 120,
+    tr_stability_wait_s: int = 600,
+    tr_request_threshold: float = 0.95,
+    tr_ignore_requests: int = 2,
     default_fan_inv: float = 0.6,
     chw_pump_head_pa: float = 80000.0,
     chw_pump_efficiency: float = 0.8,
@@ -884,6 +896,27 @@ def run_simulation(
     zone_pid_max_step = float(max(zone_pid_max_step, 1e-6))
     coil_valve_hold_deadband = float(max(coil_valve_hold_deadband, 0.0))
     coil_valve_filter_alpha = float(np.clip(coil_valve_filter_alpha, 0.0, 1.0))
+    # Trim & Respond parameters (ASHRAE G36)
+    use_trim_respond = bool(use_trim_respond)
+    tr_sample_s = int(max(tr_sample_s, 1))
+    tr_stability_wait_s = int(max(tr_stability_wait_s, 0))
+    tr_ignore_requests = int(max(tr_ignore_requests, 0))
+    tr_request_threshold = float(np.clip(tr_request_threshold, 0.0, 1.0))
+    tr_min_sp_val = float(mod_sp_floor if tr_min_sp is None else tr_min_sp)
+    tr_min_sp_val = float(np.clip(tr_min_sp_val, 50.0, static_pressure_limit))
+    tr_max_sp_val = float(
+        static_pressure_limit
+        if tr_max_sp is None
+        else np.clip(tr_max_sp, tr_min_sp_val, static_pressure_limit)
+    )
+    tr_initial_sp_val = tr_initial_sp
+    if tr_initial_sp_val is None:
+        # Start from the upper end so the system can safely trim down
+        tr_initial_sp_val = float(min(max(mod_sp_ceiling, tr_min_sp_val), tr_max_sp_val))
+    tr_initial_sp_val = float(np.clip(tr_initial_sp_val, tr_min_sp_val, tr_max_sp_val))
+    tr_trim_pa = float(tr_trim_pa)
+    tr_respond_pa = float(tr_respond_pa)
+    tr_max_step_pa = float(max(tr_max_step_pa, 0.0))
     # --- 各ゾーンに対応したPID制御器を生成し、初期ゲインと出力を設定 ---
     pids: List[pv.PID] = []
     for _ in zones:
@@ -1388,6 +1421,12 @@ def run_simulation(
         occupant_profiles_weekday.append(weekday_profile)
         occupant_profiles_weekend.append(weekend_profile)
 
+    # --- Trim & Respond state (reset each time HVAC stops) ---
+    tr_sp = tr_initial_sp_val
+    tr_elapsed_enable_s = 0.0
+    tr_elapsed_sample_s = 0.0
+    prev_hvac_on = False
+
     # --- コイル制御用の積分項とロギングバッファを初期化 ---
     coil_integral = 0.0  # コイルPIDの積分項（凍結防止のため範囲制限あり）
     coil_valve_state = 0.0
@@ -1484,7 +1523,45 @@ def run_simulation(
                 zone_requested_flows[idx] = 0.0
 
         # --- 営業時間内かどうかでファン制御・給外気制御を切り替える ---
+        static_pressure_sp = 0.0
         if hvac_on:
+            # Trim & Respond per ASHRAE G36: reset duct static pressure setpoint based on damper requests
+            if not prev_hvac_on:
+                tr_sp = tr_initial_sp_val
+                tr_elapsed_enable_s = 0.0
+                tr_elapsed_sample_s = 0.0
+
+            tr_elapsed_enable_s += timestep_s
+            tr_elapsed_sample_s += timestep_s
+
+            if use_trim_respond and tr_elapsed_enable_s >= tr_stability_wait_s:
+                if tr_elapsed_sample_s >= tr_sample_s:
+                    tr_elapsed_sample_s = 0.0
+                    requests = int(np.sum(damper_positions >= tr_request_threshold))
+                    delta = tr_trim_pa
+                    if requests > tr_ignore_requests:
+                        respond_delta = tr_respond_pa * (requests - tr_ignore_requests)
+                        respond_delta = float(
+                            np.clip(respond_delta, -tr_max_step_pa, tr_max_step_pa)
+                        )
+                        delta += respond_delta
+                    delta = float(np.clip(delta, -tr_max_step_pa, tr_max_step_pa))
+                    tr_sp = float(np.clip(tr_sp + delta, tr_min_sp_val, tr_max_sp_val))
+            else:
+                # Keep sampling clock bounded even if TR disabled
+                tr_elapsed_sample_s = float(min(tr_elapsed_sample_s, tr_sample_s))
+
+            if use_trim_respond:
+                static_pressure_sp = tr_sp
+            else:
+                mod = float(np.max(damper_positions)) if damper_positions.size else 0.0
+                sp_floor = float(np.clip(mod_sp_floor, 100.0, static_pressure_limit))
+                sp_ceiling = float(np.clip(mod_sp_ceiling, sp_floor, static_pressure_limit))
+                if sp_ceiling <= sp_floor + 1.0:
+                    sp_ceiling = sp_floor
+                mod_norm = float(np.clip((mod - 0.95) / (1.0 - 0.95), 0.0, 1.0))
+                static_pressure_sp = sp_floor + (sp_ceiling - sp_floor) * mod_norm
+
             if actions.fan_speed is not None:
                 fan.inv = float(np.clip(actions.fan_speed, 0.0, max_fan_inv))
                 (
@@ -1498,14 +1575,6 @@ def run_simulation(
                     return_trunk_dp_pa,
                 ) = solve_air_network(damper_positions, True)
             else:
-                mod = float(np.max(damper_positions)) if damper_positions.size else 0.0
-                sp_floor = float(np.clip(mod_sp_floor, 100.0, static_pressure_limit))
-                sp_ceiling = float(np.clip(mod_sp_ceiling, sp_floor, static_pressure_limit))
-                if sp_ceiling <= sp_floor + 1.0:
-                    sp_ceiling = sp_floor
-                mod_norm = float(np.clip((mod - 0.85) / (0.95 - 0.85), 0.0, 1.0))
-                sp_target = sp_floor + (sp_ceiling - sp_floor) * mod_norm
-
                 (
                     zone_vol_flows,
                     zone_dp_pa,
@@ -1515,8 +1584,13 @@ def run_simulation(
                     coil_dp_active_pa,
                     supply_trunk_dp_pa,
                     return_trunk_dp_pa,
-                ) = balance_fan_to_static(sp_target, damper_positions)
+                ) = balance_fan_to_static(static_pressure_sp, damper_positions)
         else:
+            # HVAC停止時はTR状態と時計をリセット
+            tr_sp = tr_initial_sp_val
+            tr_elapsed_enable_s = 0.0
+            tr_elapsed_sample_s = 0.0
+
             fan.inv = 0.0
             zone_vol_flows = np.zeros(len(zones), dtype=float)
             zone_dp_pa = np.zeros(len(zones), dtype=float)
@@ -1978,6 +2052,7 @@ def run_simulation(
         # 1タイムステップ分の状態量を辞書化し、ロギングリストへ追加
         records.append(record)
         current_time += timedelta(seconds=timestep_s)
+        prev_hvac_on = hvac_on
 
     # --- 蓄積した記録をDataFrame化し、時間をインデックスに設定して返却 ---
     df = pd.DataFrame.from_records(records).set_index("time")

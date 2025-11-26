@@ -116,6 +116,21 @@ def main() -> None:
     timestep_s = 60
     setpoint = 26.0
 
+    # ASHRAE G36 Trim & Respond parameters (shared with simulation_ref)
+    tr_params = dict(
+        use_trim_respond=True,
+        tr_initial_sp=None,          # default: start near ceiling then trim down
+        tr_min_sp=None,              # default: mod_sp_floor
+        tr_max_sp=None,              # default: static_pressure_limit
+        tr_trim_pa=-15.0,
+        tr_respond_pa=25.0,
+        tr_max_step_pa=75.0,
+        tr_sample_s=120,
+        tr_stability_wait_s=600,
+        tr_request_threshold=0.95,
+        tr_ignore_requests=2,
+    )
+
     sim_kwargs = dict(
         start=start,
         minutes=minutes,
@@ -132,10 +147,11 @@ def main() -> None:
         zone_pid_t_reset=30,
         zone_pid_t_step=1,
         zone_pid_max_step=0.10,
+        **tr_params,
     )
 
-    selected_kp = 1.1667
-    selected_ti = 60.0
+    selected_kp = 0.03
+    selected_ti = 150
     print(
         f"Running baseline PID simulation -> kp={selected_kp:.3f}, ti={selected_ti:.1f}"
     )
