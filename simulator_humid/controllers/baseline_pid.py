@@ -150,8 +150,8 @@ def main() -> None:
         **tr_params,
     )
 
-    selected_kp = 0.03
-    selected_ti = 150
+    selected_kp = 1.0
+    selected_ti = 250
     print(
         f"Running baseline PID simulation -> kp={selected_kp:.3f}, ti={selected_ti:.1f}"
     )
