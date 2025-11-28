@@ -51,5 +51,5 @@ def add_absolute_humidity_column(csv_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    default_path = WEATHER_DATA_DIR / "outdoor_temp_20250729.csv"
+    default_path = WEATHER_DATA_DIR / "outdoor_temp_20250628.csv"
     add_absolute_humidity_column(default_path)

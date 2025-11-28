@@ -3,5 +3,5 @@ git reset --hard origin/main
 git clean -fd
 
 git add -A
-git commit -m "well done trim & respond"
+git commit -m "before codex to modeling"
 git push origin main

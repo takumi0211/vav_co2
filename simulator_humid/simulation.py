@@ -46,7 +46,7 @@ from simulator_humid.config.duct_geometry import (
 # 気象庁の観測CSVを読み込み、外気温・外気湿度の連続時系列を整備
 # ---------------------------------------------------------------------------
 # JMAの10分値を元に外気温・湿度時系列を読み込み、全時刻で補間できるよう整備
-OUTDOOR_DATA_PATH = WEATHER_DATA_DIR / "outdoor_temp_20250729.csv"
+OUTDOOR_DATA_PATH = WEATHER_DATA_DIR / "outdoor_temp_20250619.csv"
 if not OUTDOOR_DATA_PATH.exists():
     raise FileNotFoundError(f"Missing outdoor temperature data: {OUTDOOR_DATA_PATH}")
 
@@ -2289,8 +2289,8 @@ def create_plots(df: pd.DataFrame, output_path: Path, damper_path: Path) -> None
 
 def main() -> None:
     """サンプル構成で24時間シミュレーションを実行し、CSVとグラフを出力する。"""
-    # 2025年7月29日の24時間を1分刻みでシミュレーションするシナリオ定義
-    start = datetime(2025, 7, 29, 0, 0)
+    # 2025年6月28日の24時間を1分刻みでシミュレーションするシナリオ定義
+    start = datetime(2025, 6, 19, 0, 0)
     # --- シミュレーション対象の4ゾーンについて熱容量や内部負荷を定義 ---
     zones = list(build_default_zones())
 

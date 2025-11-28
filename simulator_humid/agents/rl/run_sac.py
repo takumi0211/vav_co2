@@ -45,7 +45,7 @@ from simulator_humid.utils.paths import RL_OUTPUT_DIR, WEATHER_DATA_DIR
 
 # ---------------------------------------------------------------------------
 # 実行パラメータ（=の右側を書き換えて使用）
-# ・天気データ: weather_data/outdoor_temp_20250729.csv（LLM runと共通）
+# ・天気データ: weather_data/outdoor_temp_20250628.csv（LLM runと共通）
 # ・人数データ: simulator_humid/simulation.py に定義された
 #   DEFAULT_ZONE_OCCUPANCY_WEEKDAY / WEEKEND（LLM runと共通）
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ CHECKPOINT_PATH = RL_OUTPUT_DIR / "sac_policy_final_no_randomize_occupancy.pt"  
 OUTPUT_DIR = RL_OUTPUT_DIR / "sac_eval_no_randomize_occupancy"  # 評価結果を保存するディレクトリ
 RUN_TAG = None  # サブフォルダ名（Noneの場合は現在時刻）
 DEVICE_NAME = None  # PyTorchデバイス指定（例: "cuda", "cuda:0"。Noneで自動判定）
-WEATHER_FILE = WEATHER_DATA_DIR / "outdoor_temp_20250729.csv"  # 気象条件CSV（LLMと同一）
+WEATHER_FILE = WEATHER_DATA_DIR / "outdoor_temp_20250628.csv"  # 気象条件CSV（LLMと同一）
 VERBOSE_STEPS = False  # Trueにするとシミュレーション各ステップを出力
 DISABLE_PLOTS = False  # Trueにするとプロット生成をスキップ
 
@@ -74,7 +74,7 @@ def enforce_llm_conditions(config: TrainingConfig, weather_csv: Path) -> None:
         raise FileNotFoundError(f"Weather file not found: {weather_csv}")
 
     config.zones = tuple(build_llm_zones())
-    config.start_time = datetime(2025, 7, 29, 0, 0)
+    config.start_time = datetime(2025, 6, 28, 0, 0)
     config.episode_minutes = 24 * 60
     config.hvac_start_hour = 8.0
     config.hvac_stop_hour = 18

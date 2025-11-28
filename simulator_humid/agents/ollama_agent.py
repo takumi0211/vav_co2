@@ -65,7 +65,7 @@ class LLMConfig:
     # === シミュレーション設定 ===
     timestep_s: int = 60  # タイムステップ（秒）
     episode_minutes: int = 24 * 60  # エピソード長（分）
-    start_time: datetime = datetime(2025, 7, 29, 0, 0)  # 開始時刻
+    start_time: datetime = datetime(2025, 6, 28, 0, 0)  # 開始時刻
     setpoint: float = 26.0  # 温度設定値
 
     # === 制御パラメータ ===

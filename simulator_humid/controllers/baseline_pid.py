@@ -109,7 +109,8 @@ def _save_metrics(df, setpoint: float) -> None:
 
 
 def main() -> None:
-    start = datetime(2025, 7, 29, 0, 0)
+    # 2025-06-19 (木) の平日に合わせて開始し、週末判定による在室ゼロを避ける
+    start = datetime(2025, 6, 19, 0, 0)
     zones = _build_zones()
 
     minutes = 24 * 60

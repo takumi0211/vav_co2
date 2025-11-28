@@ -41,7 +41,7 @@ class CandidateResult:
     metrics: Dict[str, float]
 
 
-START_TIME = datetime(2025, 7, 29, 0, 0)
+START_TIME = datetime(2025, 6, 28, 0, 0)
 SETPOINT = 26.0
 SUPPLY_AIR_SETPOINT = 16.0
 MOD_SP_FLOOR = 200.0
