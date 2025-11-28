@@ -71,6 +71,44 @@ OUTDOOR_RHS = _outdoor_df["relative_humidity"].to_numpy()
 OUTDOOR_CO2_PPM = 420.0
 
 # ---------------------------------------------------------------------------
+# 電力のCO2排出係数（動的）を読み込み、分単位で補間できるように整備
+# ---------------------------------------------------------------------------
+CO2_FACTOR_PATH = WEATHER_DATA_DIR / "co2" / "dynamic_co2_factor_20250619.csv"
+if not CO2_FACTOR_PATH.exists():
+    raise FileNotFoundError(f"Missing CO2 factor data: {CO2_FACTOR_PATH}")
+
+_co2_factor_df = pd.read_csv(CO2_FACTOR_PATH)
+if "minutes" not in _co2_factor_df.columns:
+    if "datetime" in _co2_factor_df.columns:
+        dt_parsed = pd.to_datetime(_co2_factor_df["datetime"])
+        _co2_factor_df["minutes"] = dt_parsed.dt.hour * 60 + dt_parsed.dt.minute
+    elif "time" in _co2_factor_df.columns:
+        dt_parsed = pd.to_datetime(_co2_factor_df["time"])
+        _co2_factor_df["minutes"] = dt_parsed.dt.hour * 60 + dt_parsed.dt.minute
+    else:
+        raise ValueError("CO2 factor file must contain either 'minutes', 'datetime', or 'time' column.")
+if "EF_kg_per_kWh" not in _co2_factor_df.columns:
+    raise ValueError("CO2 factor file must contain 'EF_kg_per_kWh' column.")
+
+_co2_factor_df = _co2_factor_df.sort_values("minutes").reset_index(drop=True)
+if _co2_factor_df.loc[0, "minutes"] > 0:
+    first_row = _co2_factor_df.loc[0].copy()
+    first_row["minutes"] = 0
+    _co2_factor_df = pd.concat([pd.DataFrame([first_row]), _co2_factor_df], ignore_index=True)
+
+CO2_FACTOR_MINUTES = _co2_factor_df["minutes"].to_numpy(dtype=float)
+CO2_FACTOR_VALUES = _co2_factor_df["EF_kg_per_kWh"].to_numpy(dtype=float)
+
+def dynamic_co2_factor(ts: datetime) -> float:
+    """Return CO2 emission factor [kg/kWh] for given timestamp (daily periodic interpolation)."""
+    if CO2_FACTOR_MINUTES.size == 0:
+        return 0.0
+    minute_of_day = ts.hour * 60.0 + ts.minute + ts.second / 60.0
+    minutes_ext = np.concatenate([CO2_FACTOR_MINUTES, CO2_FACTOR_MINUTES + 1440.0])
+    values_ext = np.concatenate([CO2_FACTOR_VALUES, CO2_FACTOR_VALUES])
+    return float(np.interp(minute_of_day, minutes_ext, values_ext))
+
+# ---------------------------------------------------------------------------
 # 簡易日射取得プロファイル（将来CSV差し替え前提）
 # ---------------------------------------------------------------------------
 SOLAR_GAIN_PATH = WEATHER_DATA_DIR / "solar_gain_default.csv"
@@ -478,6 +516,7 @@ class HVACActions:
     """各タイムステップで外部から与えるアクチュエータ指令値を保持する。"""
 
     # --- 供給ファンやダンパーなどの操作量をまとめた入力群 ---
+    zone_setpoints: Optional[List[float]] = None  # 各ゾーンの温度設定値[℃]
     zone_dampers: Optional[List[float]] = None  
     oa_damper: Optional[float] = None  
     fan_speed: Optional[float] = None  
@@ -865,6 +904,8 @@ def run_simulation(
     coil_valve_filter_alpha: float = 0.25,
     supply_air_setpoint: float = 16.0,
     setpoint: float = 26.0,
+    setpoint_min: float = 23.5,
+    setpoint_max: float = 26.0,
     action_callback: Optional[Callable[[datetime, np.ndarray, np.ndarray, np.ndarray], HVACActions]] = None,
     zone_pid_kp: float = 0.06,
     zone_pid_ti: float = 2.50,
@@ -873,7 +914,13 @@ def run_simulation(
     zone_pid_t_step: int = 1,
     zone_pid_max_step: float = 0.10,
     hvac_start_hour: float = 8.0,
-    hvac_stop_hour: int = 18,
+    hvac_stop_hour: float = 18.0,
+    force_weekday_occupancy: bool = False,
+    co2_target_ppm: float = 1000.0,
+    co2_integral_clip: float = 8000.0,
+    co2_kp: float = 0.0008,
+    co2_ki: float = 0.0,
+    oa_frac_max: float = 0.6,
     verbose_steps: bool = False,
 ) -> pd.DataFrame:
     """VAVシステムの逐次シミュレーションを実行し、結果をDataFrameで返す。
@@ -887,6 +934,12 @@ def run_simulation(
     current_time = start
     pump_efficiency = float(np.clip(chw_pump_efficiency, 0.05, 0.95))
     bypass_factor = float(np.clip(coil_bypass_factor, 0.0, 0.95))
+    setpoint_min = float(setpoint_min)
+    setpoint_max = float(setpoint_max)
+    dt_hours = float(timestep_s) / 3600.0
+    energy_cum_kwh = 0.0
+    co2_emission_cum_kg = 0.0
+    co2_integral = 0.0
 
     # 各ゾーンVAV用PIDを生成し、ダンパー開度の自己調整が行えるようにする
     zone_pid_ti = float(max(zone_pid_ti, 1e-6))
@@ -1451,6 +1504,14 @@ def run_simulation(
             if user_actions is not None:
                 actions = user_actions
 
+        # --- ゾーンごとの設定温度を決定（エージェント指令があれば優先） ---
+        zone_setpoints = np.full(len(zones), setpoint, dtype=float)
+        if actions.zone_setpoints is not None:
+            for idx, sp in enumerate(actions.zone_setpoints[: len(zones)]):
+                zone_setpoints[idx] = float(np.clip(sp, setpoint_min, setpoint_max))
+        avg_setpoint = float(np.mean(zone_setpoints)) if len(zone_setpoints) > 0 else float(setpoint)
+        supply_air_setpoint = float(np.clip(avg_setpoint - 10.0, 10.0, 30.0))
+
         # ゾーンごとの希望風量・計算結果・内部熱取得を格納する作業配列を確保
         zone_requested_flows = np.zeros(len(zones))
         zone_vol_flows = np.zeros(len(zones))
@@ -1460,7 +1521,7 @@ def run_simulation(
         internal_gains = np.zeros(len(zones))
 
         # --- 在室人数と内部発熱を算出するため、曜日種別を判定 ---
-        is_weekend = current_time.weekday() >= 5
+        is_weekend = current_time.weekday() >= 5 and not force_weekday_occupancy
         # --- ゾーンごとの時間別在室人数をプロファイルから取得 ---
         occupant_counts = np.zeros(len(zones))
         # --- 各ゾーンで熱・CO2・湿度バランス方程式を解き、次時刻の状態を更新 ---
@@ -1510,7 +1571,7 @@ def run_simulation(
                 if actions.zone_dampers is not None and idx < len(actions.zone_dampers):
                     damper_positions[idx] = float(np.clip(actions.zone_dampers[idx], 0.0, 1.0))
                 else:
-                    damper_positions[idx] = pids[idx].control(sp=setpoint, mv=zone_temps[idx])
+                    damper_positions[idx] = pids[idx].control(sp=zone_setpoints[idx], mv=zone_temps[idx])
                 zone_requested_flows[idx] = zone.flow_min + damper_positions[idx] * (
                     zone.flow_max - zone.flow_min
                 )
@@ -1649,16 +1710,33 @@ def run_simulation(
         chw_pump_dp_pa = 0.0
         chw_pump_inv = 0.0
         chiller_power_kw = 0.0
+        power_total_kw = 0.0
+        co2_factor_now = dynamic_co2_factor(current_time)
+        energy_step_kwh = 0.0
+        co2_emission_step = 0.0
 
         if hvac_on and total_flow > 1e-6:
             # --- 給外気量と混合空気状態を決定し、コイル負荷計算の準備 ---
             return_temp = float(np.sum(zone_flows * zone_temps) / total_flow)
+            peak_co2_ppm = float(np.max(zone_co2_ppm)) if zone_co2_ppm.size else OUTDOOR_CO2_PPM
             if actions.oa_damper is not None:
                 oa_damper = float(np.clip(actions.oa_damper, 0.0, 1.0))
                 oa_flow = float(np.clip(oa_damper * total_flow, oa_flow_min, total_flow))
             else:
                 oa_flow = float(np.clip(max(oa_frac_min * total_flow, oa_flow_min), 0.0, total_flow))
                 oa_damper = oa_flow / total_flow
+                co2_error = peak_co2_ppm - co2_target_ppm
+                co2_integral += co2_error * timestep_s
+                co2_integral = float(np.clip(co2_integral, -co2_integral_clip, co2_integral_clip))
+                if co2_error > 0:
+                    oa_damper = float(
+                        np.clip(
+                            oa_damper + co2_kp * co2_error + co2_ki * co2_integral,
+                            oa_damper,
+                            oa_frac_max,
+                        )
+                    )
+                    oa_flow = float(np.clip(oa_damper * total_flow, oa_flow_min, total_flow))
             recirc_flow = max(total_flow - oa_flow, 0.0)
             if total_flow > 0:
                 ra_damper = recirc_flow / total_flow
@@ -1686,7 +1764,10 @@ def run_simulation(
             cp_mdot = total_flow * CP_AIR
             # --- コイルバルブの開度をPIDまたは外部指令から決定 ---
             coil_valve_cmd = 0.0
-            if actions.coil_valve is not None:
+            disable_cooling = bool(np.all(zone_setpoints > zone_temps))
+            if disable_cooling:
+                coil_valve_cmd = 0.0
+            elif actions.coil_valve is not None:
                 coil_valve_cmd = float(np.clip(actions.coil_valve, 0.0, 1.0))
             else:
                 supply_feedback = last_supply_temp
@@ -1853,6 +1934,13 @@ def run_simulation(
 
         fan_power_kw = float(fan.pw)
         fan_dp_pa = float(fan.dp)
+
+        power_total_kw = fan_power_kw + chw_pump_power_kw + chiller_power_kw
+        co2_factor_now = dynamic_co2_factor(current_time)
+        energy_step_kwh = power_total_kw * dt_hours
+        co2_emission_step = power_total_kw * co2_factor_now * dt_hours
+        energy_cum_kwh += energy_step_kwh
+        co2_emission_cum_kg += co2_emission_step
 
         next_zone_temps = zone_temps.copy()
         next_zone_t_mass = zone_t_mass.copy()
@@ -2034,6 +2122,12 @@ def run_simulation(
             "supply_trunk_dp_pa": supply_trunk_dp_pa,
             "return_trunk_dp_pa": return_trunk_dp_pa,
             "fan_inv": float(fan.inv),
+            "power_total_kw": power_total_kw,
+            "energy_kwh": energy_step_kwh,
+            "energy_cum_kwh": energy_cum_kwh,
+            "co2_factor_kg_per_kwh": co2_factor_now,
+            "co2_emission_kg": co2_emission_step,
+            "co2_emission_cum_kg": co2_emission_cum_kg,
         }
 
         for idx, zone in enumerate(zones):
@@ -2044,6 +2138,7 @@ def run_simulation(
             record[f"zone{idx + 1}_co2_ppm"] = zone_co2_ppm[idx]
             record[f"zone{idx + 1}_rh"] = zone_rh[idx]
             record[f"zone{idx + 1}_occupancy"] = occupant_counts[idx]
+            record[f"zone{idx + 1}_setpoint"] = zone_setpoints[idx]
 
         record["oa_damper"] = oa_damper
         record["ra_damper"] = ra_damper
@@ -2128,13 +2223,11 @@ def zone_pid_cost(metrics: Dict[str, float]) -> float:
 
 
 def create_plots(df: pd.DataFrame, output_path: Path, damper_path: Path) -> None:
-    """主要な温度・流量・電力指標を図化しPNGで保存するユーティリティ。"""
-    # 保存先ディレクトリを確保
+    """主要指標を図化。既存の温度/流量/湿度/制御系プロットは維持し、最下段の追加プロットにPower・CO₂係数・設定温度を重ねる。"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     damper_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # --- 温度・風量・電力・ダンパー開度を見やすくチャート化して保存 ---
-    fig, axes = plt.subplots(8, 1, figsize=(11, 32), sharex=True)
+    fig, axes = plt.subplots(9, 1, figsize=(11, 36), sharex=True)
 
     zone_temp_cols = [col for col in df.columns if col.endswith("_temp") and col.startswith("zone")]
     df[zone_temp_cols].plot(ax=axes[0])
@@ -2147,7 +2240,6 @@ def create_plots(df: pd.DataFrame, output_path: Path, damper_path: Path) -> None
     flow_cols = [col for col in df.columns if col.endswith("_flow_kg_s") and col.startswith("zone")]
     chw_flow_col = [col for col in df.columns if col == "chw_flow_kg_s"]
 
-    # ゾーンのフローは左軸、CHWフローは右軸
     (df[flow_cols] * 3600).plot(ax=axes[1], legend=True)
     axes[1].set_ylabel("Supply Flow [kg/h]")
     axes[1].set_title("Zone Supply Mass Flow")
@@ -2155,11 +2247,9 @@ def create_plots(df: pd.DataFrame, output_path: Path, damper_path: Path) -> None
 
     if chw_flow_col:
         ax2 = axes[1].twinx()
-        # 冷水流量は別軸でプロットして空気系との関係を確認
         (df[chw_flow_col] * 3600).plot(ax=ax2, color="k", linestyle="--", legend=True)
         ax2.set_ylabel("CHW Flow [kg/h]")
         ax2.grid(True, which='both', linestyle=':', linewidth=0.7, alpha=0.8)
-        # 凡例を両方表示
         lines1, labels1 = axes[1].get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         axes[1].legend(lines1 + lines2, labels1 + labels2, loc="upper left")
@@ -2167,24 +2257,12 @@ def create_plots(df: pd.DataFrame, output_path: Path, damper_path: Path) -> None
     power_cols = ["chiller_power_kw", "fan_power_kw"]
     if "chw_pump_power_kw" in df.columns:
         power_cols.append("chw_pump_power_kw")
-
-    legend_labels = []
-    for col in power_cols:
-        if col == "chiller_power_kw":
-            legend_labels.append("Chiller Power (COP=4.0 const)")
-        elif col == "fan_power_kw":
-            legend_labels.append("Fan Power")
-        elif col == "chw_pump_power_kw":
-            legend_labels.append("CHW Pump Power")
-        else:
-            legend_labels.append(col)
     df[power_cols].plot(ax=axes[2])
     axes[2].set_ylabel("Power [kW]")
     axes[2].set_title("Chiller, Fan, and Pump Power")
     axes[2].grid(True, which='both', linestyle=':', linewidth=0.7, alpha=0.8)
-    axes[2].legend(legend_labels, loc="upper right")
+    axes[2].legend(["Chiller Power", "Fan Power", "CHW Pump Power"], loc="upper right")
 
-    # 空気温度のプロット
     df[["return_temp", "outdoor_temp", "mixed_temp", "supply_temp"]].plot(ax=axes[3])
     axes[3].set_ylabel("Air Temp [°C]")
     axes[3].set_ylim(5.0, 40.0)
@@ -2207,7 +2285,6 @@ def create_plots(df: pd.DataFrame, output_path: Path, damper_path: Path) -> None
         axes[5].legend(loc="upper right")
         axes[5].grid(True, which='both', linestyle=':', linewidth=0.7, alpha=0.8)
 
-    # 相対湿度のプロット（ゾーン）
     rh_cols = [col for col in df.columns if col.endswith("_rh") and col.startswith("zone")]
     if rh_cols:
         df[rh_cols].plot(ax=axes[6])
@@ -2222,7 +2299,6 @@ def create_plots(df: pd.DataFrame, output_path: Path, damper_path: Path) -> None
     else:
         axes[6].set_visible(False)
 
-    # 系統空気（RA/OA/MA/SA）の相対湿度を温度と同様に可視化
     system_rh_cols = [col for col in ["return_rh", "outdoor_rh", "mixed_rh", "supply_rh"] if col in df.columns]
     if system_rh_cols:
         df[system_rh_cols].plot(ax=axes[7])
@@ -2236,6 +2312,55 @@ def create_plots(df: pd.DataFrame, output_path: Path, damper_path: Path) -> None
         axes[7].grid(True, which='both', linestyle=':', linewidth=0.7, alpha=0.8)
     else:
         axes[7].set_visible(False)
+
+    # --- 追加のCO2係数×Power×セットポイントプロット ---
+    # --- 追加パネル: CO2係数 + Power + ゾーン設定温度 ---
+    if "co2_factor_kg_per_kwh" in df.columns:
+        co2_factor_series = df["co2_factor_kg_per_kwh"]
+        if "power_total_kw" in df.columns:
+            power_series = df["power_total_kw"]
+        else:
+            power_series = (
+                df.get("fan_power_kw", pd.Series(0.0, index=df.index))
+                + df.get("chiller_power_kw", pd.Series(0.0, index=df.index))
+                + df.get("chw_pump_power_kw", pd.Series(0.0, index=df.index))
+            )
+        setpoint_cols = sorted(col for col in df.columns if col.endswith("_setpoint") and col.startswith("zone"))
+
+        ax_cf = axes[8]
+        co2_factor_series.plot(ax=ax_cf, color="tab:green", label="CO₂ factor [kg/kWh]")
+        ax_cf.set_ylabel("CO₂ factor [kg/kWh]")
+        ax_cf.set_title("CO₂ Factor + Power + Zone Setpoints")
+        ax_cf.grid(True, which='both', linestyle=':', linewidth=0.7, alpha=0.8)
+
+        ax_pow = ax_cf.twinx()
+        power_series.plot(ax=ax_pow, color="tab:blue", alpha=0.7, label="Power [kW]")
+        ax_pow.set_ylabel("Power [kW]")
+
+        # 設定温度は右側オフセット軸で全ゾーン表示
+        ax_set = ax_cf.twinx()
+        ax_set.spines["right"].set_position(("axes", 1.08))
+        ax_set.set_zorder(ax_pow.get_zorder() + 1)
+        ax_set.patch.set_alpha(0.0)
+        if setpoint_cols:
+            for idx, col in enumerate(setpoint_cols):
+                ax_set.plot(
+                    df.index,
+                    df[col],
+                    linestyle="-",
+                    linewidth=1.0,
+                    alpha=0.35,
+                    label=col,
+                )
+        ax_set.set_ylabel("Setpoint [°C]")
+        ax_set.set_ylim(20, 30)
+
+        lines1, labels1 = ax_cf.get_legend_handles_labels()
+        lines2, labels2 = ax_pow.get_legend_handles_labels()
+        lines3, labels3 = ax_set.get_legend_handles_labels()
+        ax_pow.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, loc="upper left")
+    else:
+        axes[8].set_visible(False)
 
     axes[-1].set_xlabel("Time")
     plt.tight_layout()

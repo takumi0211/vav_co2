@@ -22,7 +22,7 @@ import csv
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, List, Sequence
 
@@ -41,6 +41,7 @@ from simulator_humid.simulation import (
     internal_gain_profile_from_occupancy,
     create_plots,
     outdoor_temperature,
+    dynamic_co2_factor,
     run_simulation,
 )
 from simulator_humid.utils.paths import LLM_OUTPUT_DIR
@@ -52,9 +53,9 @@ from simulator_humid.utils.paths import LLM_OUTPUT_DIR
 class LLMConfig:
     # === 報酬設計パラメータ ===
     temp_sigma: float = 0.25  # 温度快適性の標準偏差
-    comfort_center: float = 26.0  # 快適温度の中心
-    comfort_low: float = 25.0  # 快適温度下限
-    comfort_high: float = 27.0  # 快適温度上限
+    comfort_center: float = 25.0  # 快適温度の中心
+    comfort_low: float = 23.5  # 快適温度下限
+    comfort_high: float = 26.5  # 快適温度上限
     comfort_penalty: float = 2.0  # 快適性違反ペナルティ
     power_weight: float = 0.2  # エネルギー消費ペナルティ重み
     co2_target_ppm: float = 1000.0  # CO₂快適基準
@@ -67,7 +68,7 @@ class LLMConfig:
     timestep_s: int = 60  # タイムステップ（秒）
     episode_minutes: int = 24 * 60  # エピソード長（分）
     start_time: datetime = datetime(2025, 6, 28, 0, 0)  # 開始時刻
-    setpoint: float = 26.0  # 温度設定値
+    setpoint: float = 25.5  # 温度設定値
 
     # === 制御パラメータ ===
     damper_min: float = 0.05  # ダンパー最小開度
@@ -78,11 +79,14 @@ class LLMConfig:
     coil_max: float = 1.0  # コイルバルブ最大開度
     fan_min: float = 0.45  # ファン最小速度
     fan_max: float = 1.4  # ファン最大速度
-    control_interval_minutes: int = 5  # 制御更新間隔（分）
+    control_interval_minutes: int = 30  # 制御更新間隔（分）
+    setpoint_low: float = 23.5  # 設定温度下限
+    setpoint_high: float = 26.0  # 設定温度上限
+    setpoint_step: float = 0.5  # 設定温度刻み
 
     # === 運転スケジュール ===
     hvac_start_hour: float = 8.0  # HVAC開始時刻（時）
-    hvac_stop_hour: int = 18  # HVAC終了時刻（時）
+    hvac_stop_hour: float = 17.5  # HVAC終了時刻（時）
 
     # === 出力・ログ設定 ===
     output_dir: Path = LLM_OUTPUT_DIR  # 出力ディレクトリ
@@ -137,6 +141,8 @@ class LLMDecisionController:
         self.high_bounds = self.scaler.high.detach().cpu().numpy().astype(np.float32)
         self.prev_action = np.asarray(self.scaler.midpoint(), dtype=np.float32)
         self.idle_action = self.low_bounds.copy()
+        self.history_len = 4
+        self.setpoint_history: list[np.ndarray] = [self.prev_action.copy() for _ in range(self.history_len)]
         self.prev_zone_temps: np.ndarray | None = None
         self.prev_zone_co2: np.ndarray | None = None
         self.prev_outdoor_temp: float | None = None
@@ -152,10 +158,7 @@ class LLMDecisionController:
             and hasattr(self.client.chat.completions, "create")
         )
         self.action_bounds = {
-            "zone_dampers": [float(config.damper_min), float(config.damper_max)],
-            "oa_damper": [float(config.oa_min), float(config.oa_max)],
-            "coil_valve": [float(config.coil_min), float(config.coil_max)],
-            "fan_speed": [float(config.fan_min), float(config.fan_max)],
+            "zone_setpoints": [float(config.setpoint_low), float(config.setpoint_high)],
         }
         self.reward_design = {
             "comfort_center_c": float(config.comfort_center),
@@ -172,21 +175,18 @@ class LLMDecisionController:
         self.system_prompt = (
             "You are GPT-5 acting as a supervisory decision-making agent for a multi-zone VAV HVAC system. "
             f"The controlled zones are: {zone_list}. "
-            "You must select actuator setpoints every 5 minutes while the HVAC plant is running. "
-            "Your objective is to maximise the reward used by the existing RL agent: reward = comfort_reward "
-            "- comfort_penalty * band_penalty - power_weight * power_kw - co2_penalty_weight * co2_penalty "
-            "- co2_violation_penalty (applied when peak CO2 crosses the violation threshold). "
-            "Maintain thermal comfort around 26 degC (comfort band 25-27 degC), keep CO2 below 1000 ppm, "
-            "and minimise fan/chiller/pump energy. Always respect the actuator limits provided and plan for the "
-            "next 5-minute interval."
+            "You must choose only the zone temperature setpoints (in degC) every 30 minutes while HVAC is running; "
+            "all other actuators (dampers, fan, coil) are rule-based. "
+            "Setpoint limits: 23.5–26.0°C in 0.5°C steps. Comfort band is 23.5–26.5°C. "
+            "Goal: minimise (comfort deviation² + ramp penalties) and CO₂ emissions = power[kW]*emission factor*0.5h. "
+            "Keep CO₂ under 1000 ppm via the built-in ventilation PI; you do not control CO₂ directly."
         )
         self.developer_prompt = (
             "Formatting rules: respond with a single JSON object. "
             "Use keys 'thought_process' (string) and 'action' (object). "
-            "The 'action' object must include 'zone_dampers' (list of length {length}), 'oa_damper', "
-            "'coil_valve', and 'fan_speed'. "
+            "The 'action' object must include 'zone_setpoints' (list of length {length}). "
             "Provide the thought_process as explicit step-by-step reasoning. "
-            "Return numeric values as floats; clip them to the provided bounds before finalising."
+            "Return numeric values as floats; clip them to the provided bounds before finalising; round to nearest 0.5°C."
         ).format(length=self.zone_count)
         self.log_path = log_path
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -228,29 +228,21 @@ class LLMDecisionController:
             f"{self.zone_names[idx]}: {zone_temps[idx]:.2f}C/{zone_co2[idx]:.0f}ppm"
             for idx in range(self.zone_count)
         )
-        # 前回のダンパー開度を取得
-        damper_state = "; ".join(
-            f"{self.zone_names[idx]}: {self.prev_action[idx] * 100.0:.1f}%"
-            for idx in range(self.zone_count)
-        )
         print(f"[{timestamp_str}] zone state -> {zone_state}")
-        print(f"    dampers -> {damper_state}")
+        print(f"    prev_setpoints -> {np.round(self.prev_action,2).tolist()}")
         
         result = self._query_llm_with_retries(prompt)
         self.last_decision_time = timestamp
         if result.error is not None:
             print(f"[LLMDecisionController] {result.error}")
-        self.prev_action = result.action_vector.copy()
-        
-        # LLMが実行したアクションを表示
-        new_damper_state = "; ".join(
-            f"{self.zone_names[idx]}: {self.prev_action[idx] * 100.0:.1f}%"
-            for idx in range(self.zone_count)
-        )
-        oa = self.prev_action[self.zone_count]
-        coil = self.prev_action[self.zone_count + 1]
-        fan = self.prev_action[self.zone_count + 2]
-        print(f"    LLM action -> dampers: [{new_damper_state}]; OA: {oa*100:.1f}%; Coil: {coil*100:.1f}%; Fan: {fan:.2f}")
+        setpoints = result.action_vector.copy()
+        setpoints = np.round(setpoints / float(self.config.setpoint_step)) * float(self.config.setpoint_step)
+        setpoints = np.clip(setpoints, self.config.setpoint_low, self.config.setpoint_high)
+        self.prev_action = setpoints
+        self.setpoint_history.append(setpoints.copy())
+        if len(self.setpoint_history) > self.history_len:
+            self.setpoint_history.pop(0)
+        print(f"    LLM action -> zone_setpoints: {np.round(self.prev_action,2).tolist()}")
         
         self._log_action(timestamp, hvac_on, prompt, result)
         return self._vector_to_actions(self.prev_action)
@@ -275,64 +267,60 @@ class LLMDecisionController:
     ) -> dict[str, Any]:
         temps = np.asarray(zone_temps, dtype=np.float32)
         co2 = np.asarray(zone_co2, dtype=np.float32)
-        if (
-            temps.shape[0] != self.zone_count
-            or co2.shape[0] != self.zone_count
-        ):
+        if temps.shape[0] != self.zone_count:
             raise ValueError("Observation dimensions do not match zone count.")
-        dt_minutes = self.config.timestep_s / 60.0
-        if self.prev_env_timestamp is not None:
-            dt_minutes = max((timestamp - self.prev_env_timestamp).total_seconds() / 60.0, 1e-6)
-        temp_delta = np.zeros_like(temps)
-        co2_delta = np.zeros_like(co2)
-        if self.prev_zone_temps is not None:
-            temp_delta = (temps - self.prev_zone_temps) / dt_minutes
-        if self.prev_zone_co2 is not None:
-            co2_delta = (co2 - self.prev_zone_co2) / dt_minutes
-        outdoor_temp = float(outdoor_temperature(timestamp))
-        temp_trend = 0.0
-        if self.prev_outdoor_temp is not None and self.prev_env_timestamp is not None:
-            dt_hours = max((timestamp - self.prev_env_timestamp).total_seconds() / 3600.0, 1e-6)
-            temp_trend = (outdoor_temp - self.prev_outdoor_temp) / dt_hours
+
+        minute_of_day = timestamp.hour * 60 + timestamp.minute
+        slot_idx = int(np.floor((minute_of_day - int(self.config.hvac_start_hour * 60)) / 30.0))
+        slot_idx = int(np.clip(slot_idx, 0, 19))
+        time_norm = (slot_idx + 1) / 20.0 if hvac_on else 0.0
+
+        outdoor_now = float(outdoor_temperature(timestamp))
+        outdoor_forecast = [
+            float(outdoor_temperature(timestamp + timedelta(minutes=30 * i))) for i in range(1, 13)
+        ]
+        co2_factor_now = float(dynamic_co2_factor(timestamp))
+        co2_factor_forecast = [
+            float(dynamic_co2_factor(timestamp + timedelta(minutes=30 * i))) for i in range(1, 13)
+        ]
+
+        prev_setpoints = self.prev_action.copy()
+        set_hist = [hist.copy().tolist() for hist in self.setpoint_history[-self.history_len :]]
+
         zone_summary: List[dict[str, Any]] = []
         for idx, name in enumerate(self.zone_names):
             zone_summary.append(
                 {
                     "name": name,
-                    "temperature_c": round(float(temps[idx]), 1),
-                    "temp_error_c": round(float(temps[idx] - self.config.setpoint), 1),
-                    "temp_delta_c_per_min": round(float(temp_delta[idx]), 2),
-                    "co2_ppm": round(float(co2[idx]), 0),
-                    "co2_delta_ppm_per_min": round(float(co2_delta[idx]), 1),
+                    "temperature_c": round(float(temps[idx]), 2),
+                    "temp_minus_setpoint_c": round(float(temps[idx] - prev_setpoints[idx]), 2),
+                    "prev_setpoint_c": round(float(prev_setpoints[idx]), 2),
+                    "setpoint_history_c": [round(float(v), 2) for v in np.asarray(set_hist)[:, idx]],
+                    "co2_ppm": round(float(co2[idx]), 1),
                 }
             )
+
         self.prev_zone_temps = temps.copy()
         self.prev_zone_co2 = co2.copy()
-        self.prev_outdoor_temp = outdoor_temp
+        self.prev_outdoor_temp = outdoor_now
         self.prev_env_timestamp = timestamp
+
         return {
             "timestamp": timestamp.isoformat(),
-            "setpoint_c": float(self.config.setpoint),
-            "control_interval_minutes": float(self.config.control_interval_minutes),
-            "time_features": {
-                "hour": timestamp.hour,
-                "minute": timestamp.minute,
-                "second": timestamp.second,
-            },
+            "time_normalized": time_norm,
+            "outdoor_temp_c": round(outdoor_now, 2),
+            "outdoor_forecast_c": [round(x, 2) for x in outdoor_forecast],
+            "co2_factor_kg_per_kwh": round(co2_factor_now, 4),
+            "co2_factor_forecast": [round(x, 4) for x in co2_factor_forecast],
             "zones": zone_summary,
-            "outdoor": {
-                "temperature_c": round(outdoor_temp, 1),
-                "temperature_trend_c_per_hour": round(temp_trend, 2),
-            },
-            "previous_action": self._vector_to_dict(self.prev_action),
+            "previous_setpoints": [round(float(v), 2) for v in prev_setpoints],
             "action_bounds": self.action_bounds,
-            "reward_design": self.reward_design,
         }
 
     def _build_prompt(self, state: dict[str, Any]) -> str:
         observation_json = json.dumps(state, ensure_ascii=False, indent=2)
         return (
-            "Observation for the next 5-minute HVAC control interval:\n"
+            "Observation for the next 30-minute HVAC control interval:\n"
             f"{observation_json}\n"
             "Select actuator commands that maximise the stated reward over the upcoming interval."
         )
@@ -507,37 +495,27 @@ class LLMDecisionController:
             raise ValueError(f"Could not parse JSON from model output: {text}")
 
     def _action_dict_to_vector(self, action: dict[str, Any]) -> np.ndarray:
-        zone_values = action.get("zone_dampers")
+        zone_values = action.get("zone_setpoints")
         if not isinstance(zone_values, list) or len(zone_values) != self.zone_count:
-            raise ValueError("zone_dampers must be a list matching the number of zones.")
+            raise ValueError("zone_setpoints must be a list matching the number of zones.")
         try:
             zone_array = np.array([float(v) for v in zone_values], dtype=np.float32)
-            oa = float(action.get("oa_damper"))
-            coil = float(action.get("coil_valve"))
-            fan = float(action.get("fan_speed"))
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Invalid actuator value: {exc}") from exc
-        vector = np.concatenate([zone_array, np.array([oa, coil, fan], dtype=np.float32)], axis=0)
-        clipped = np.clip(vector, self.low_bounds, self.high_bounds)
-        return clipped
+        vector = np.clip(zone_array, self.low_bounds, self.high_bounds)
+        return vector
 
     def _vector_to_dict(self, vector: np.ndarray) -> dict[str, Any]:
         arr = np.asarray(vector, dtype=np.float32)
         zone_vals = [round(float(v), 4) for v in arr[: self.zone_count]]
         return {
-            "zone_dampers": zone_vals,
-            "oa_damper": round(float(arr[self.zone_count]), 4),
-            "coil_valve": round(float(arr[self.zone_count + 1]), 4),
-            "fan_speed": round(float(arr[self.zone_count + 2]), 4),
+            "zone_setpoints": zone_vals,
         }
 
     def _vector_to_actions(self, vector: np.ndarray) -> HVACActions:
         arr = np.asarray(vector, dtype=np.float32)
         actions = HVACActions()
-        actions.zone_dampers = arr[: self.zone_count].tolist()
-        actions.oa_damper = float(arr[self.zone_count])
-        actions.coil_valve = float(arr[self.zone_count + 1])
-        actions.fan_speed = float(arr[self.zone_count + 2])
+        actions.zone_setpoints = arr[: self.zone_count].tolist()
         return actions
 
     def _log_action(
@@ -574,18 +552,8 @@ def build_action_scaler(config: LLMConfig) -> ActionScaler:
 
     """ゾーン数に応じたアクションスケーラを組み立てる。"""
     zone_count = len(config.zones)
-    low = np.concatenate(
-        [
-            np.full(zone_count, config.damper_min, dtype=np.float32),
-            np.array([config.oa_min, config.coil_min, config.fan_min], dtype=np.float32),
-        ]
-    )
-    high = np.concatenate(
-        [
-            np.full(zone_count, config.damper_max, dtype=np.float32),
-            np.array([config.oa_max, config.coil_max, config.fan_max], dtype=np.float32),
-        ]
-    )
+    low = np.full(zone_count, config.setpoint_low, dtype=np.float32)
+    high = np.full(zone_count, config.setpoint_high, dtype=np.float32)
     return ActionScaler(low=torch.from_numpy(low), high=torch.from_numpy(high))
 
 def build_simulation_kwargs(config: LLMConfig) -> dict:
@@ -604,12 +572,17 @@ def build_simulation_kwargs(config: LLMConfig) -> dict:
         "fan_nominal_flow_m3_min": 100.0,
         "chw_pump_efficiency": 0.8,
         "setpoint": config.setpoint,
+        "setpoint_min": config.setpoint_low,
+        "setpoint_max": config.setpoint_high,
         "zone_pid_kp": 0.6,
         "zone_pid_ti": 25.0,
         "zone_pid_t_reset": 30,
         "zone_pid_t_step": 2,
         "hvac_start_hour": config.hvac_start_hour,
         "hvac_stop_hour": config.hvac_stop_hour,
+        "co2_target_ppm": config.co2_target_ppm,
+        "oa_frac_max": config.oa_max,
+        "force_weekday_occupancy": True,
     }
 
 def compute_step_rewards(df: pd.DataFrame, config: LLMConfig) -> tuple[np.ndarray, np.ndarray]:

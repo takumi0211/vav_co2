@@ -20,7 +20,7 @@ if __package__ in (None, ""):
 import math
 import random
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Sequence, Optional
 
@@ -42,6 +42,7 @@ from simulator_humid.simulation import (
     internal_gain_profile_from_occupancy,
     create_plots,
     outdoor_temperature,
+    dynamic_co2_factor,
     run_simulation,
 )
 from simulator_humid.utils.paths import PEOPLE_DATA_DIR, RL_OUTPUT_DIR, WEATHER_DATA_DIR
@@ -69,26 +70,25 @@ class TrainingConfig:
     noise_clip: float = 0.5  # 追加アクションノイズのクリップ範囲
 
     # === 報酬設計パラメータ ===
-    temp_sigma: float = 0.6  # 温度快適性の標準偏差（SACと統一）
-    comfort_center: float = 26.0  # 快適温度の中心
-    comfort_low: float = 25.0  # 快適温度下限
-    comfort_high: float = 27.0  # 快適温度上限
-    comfort_penalty: float = 2.0  # 快適性違反ペナルティ
-    power_weight: float = 0.2  # エネルギー消費ペナルティ重み
-    off_hvac_weight: float = 0.2  # HVAC停止時ペナルティ重み
-    coil_bonus_weight: float = 0.5  # コイル開度ボーナス係数
-    coil_bonus_threshold: float = 0.7  # ボーナスを与え始める開度
-    co2_target_ppm: float = 1000.0  # CO₂快適基準
-    co2_penalty_weight: float = 0.5  # CO₂ペナルティ重み
+    comfort_center: float = 25.0  # 快適温度の中心
+    comfort_low: float = 23.5  # 快適温度下限
+    comfort_high: float = 26.5  # 快適温度上限
+    comfort_weight: float = 1.0  # 快適性違反の重み
+    ramp_short_threshold: float = 1.5  # 30分の温度変化閾値
+    ramp_long_threshold: float = 2.5  # 60分の温度変化閾値
+    ramp_weight: float = 0.5  # 温度ランプペナルティ重み
+    emission_weight: float = 1.0  # CO2排出量（kg）に対する重み
+    co2_target_ppm: float = 1000.0  # 換気PI制御のターゲット
+    co2_penalty_weight: float = 0.0  # （IAQ罰則はデフォルト無効）
     co2_logistic_k: float = 12.0  # ロジスティック関数の傾き係数
     co2_violation_threshold: float = 1100.0  # CO₂違反閾値
-    co2_violation_penalty: float = 10.0  # CO₂違反ペナルティ重み
+    co2_violation_penalty: float = 0.0  # デフォルト無効
 
     # === シミュレーション設定 ===
     timestep_s: int = 60  # タイムステップ（秒）
     episode_minutes: int = 24 * 60  # エピソード長（分）
     start_time: datetime = datetime(2025, 6, 28, 0, 0)  # 開始時刻です
-    setpoint: float = 26.0  # 温度設定値
+    setpoint: float = 25.5  # 初期温度設定値
 
     # === ネットワーク構造 ===
     hidden_sizes: Sequence[int] = (256, 256, 128)  # アクター隠れ層サイズ
@@ -105,11 +105,14 @@ class TrainingConfig:
     coil_max: float = 1.0  # コイルバルブ最大開度
     fan_min: float = 0.45  # ファン最小速度
     fan_max: float = 1.4  # ファン最大速度
-    control_interval_minutes: int = 5  # 制御更新間隔（分）
+    control_interval_minutes: int = 30  # 制御更新間隔（分）
+    setpoint_low: float = 23.5  # アクション下限
+    setpoint_high: float = 26.0  # アクション上限
+    setpoint_step: float = 0.5  # アクションの量子化刻み
 
     # === 運転スケジュール ===
     hvac_start_hour: float = 8.0  # HVAC開始時刻（時）
-    hvac_stop_hour: int = 18  # HVAC終了時刻（時）
+    hvac_stop_hour: float = 18  # HVAC終了時刻（時）
     eval_start_hour: int = 8  # 評価開始時刻（時）
     eval_stop_hour: int = 18  # 評価終了時刻（時）
 
@@ -117,11 +120,12 @@ class TrainingConfig:
     output_dir: Path = RL_OUTPUT_DIR  # 出力ディレクトリ
     weather_data_dir: Path = WEATHER_DATA_DIR  # 外気データ格納ディレクトリ
     people_data_dir: Path = PEOPLE_DATA_DIR  # 在室パターンCSV格納ディレクトリ
-    randomize_weather: bool = True  # エピソード毎に気象CSVをランダム入れ替え
-    randomize_occupancy: bool = False  # エピソード毎に在室パターンをランダム入れ替え
+    randomize_weather: bool = False  # 気象は固定ファイル
+    randomize_occupancy: bool = False  # 在室パターン固定（平日）
+    force_weekday_occupancy: bool = True  # 週末も平日プロファイルを適用
     log_interval: int = 1  # ログ出力間隔
-    print_every: int = 200  # コンソール出力間隔
-    plot_every: int = 200  # プロット出力間隔（0で無効）
+    print_every: int = 1  # コンソール出力間隔
+    plot_every: int = 1  # プロット出力間隔（0で無効）
     seed: int = 42  # 乱数シード
     zones: Sequence[ZoneConfig] = field(default_factory=list)  # ゾーン設定
 
@@ -452,6 +456,8 @@ class PolicyController:
         self.tanh_history: List[np.ndarray] = []
         self.timestamps: List[datetime] = []
         self.decision_flags: List[bool] = []
+        self.history_len = 4
+        self.setpoint_history: List[np.ndarray] = [self.prev_action.copy() for _ in range(self.history_len)]
 
     def build_observation(
         self,
@@ -460,57 +466,76 @@ class PolicyController:
         zone_co2: np.ndarray,
     ) -> np.ndarray:
 
-        """現在の環境状態から学習用の観測ベクトルを組み立てる。"""
+        """現在の環境状態から学習用の観測ベクトルを組み立てる。
+
+        仕様に合わせて30分ステップの時間特徴、外気/CO2係数の6時間先予測、
+        各ゾーンの温度・設定温度履歴を含める。
+        """
 
         zone_temps = zone_temps.astype(np.float32)
-        zone_co2 = zone_co2.astype(np.float32)
-        if self.prev_zone_temps is None:
-            temp_delta = np.zeros_like(zone_temps)
-        else:
-            temp_delta = zone_temps - self.prev_zone_temps
-        if self.prev_zone_co2 is None:
-            co2_delta = np.zeros_like(zone_co2)
-        else:
-            co2_delta = zone_co2 - self.prev_zone_co2
+        zone_count = len(zone_temps)
+        current_setpoints = self.prev_action[:zone_count]  # 直前に指示した設定温度
 
-        self.prev_zone_temps = zone_temps.copy()
-        self.prev_zone_co2 = zone_co2.copy()
+        # --- 時刻特徴（8:00-17:30を20区間とみなして1..20/20で正規化） ---
+        minute_of_day = timestamp.hour * 60 + timestamp.minute
+        slot_idx = int(np.floor((minute_of_day - int(self.config.hvac_start_hour * 60)) / 30.0))
+        slot_idx = int(np.clip(slot_idx, 0, 19))
+        time_feat = (slot_idx + 1) / 20.0 if self.config.hvac_start_hour <= minute_of_day / 60.0 < self.config.hvac_stop_hour else 0.0
 
-        temp_error = zone_temps - self.config.setpoint
-        co2_error = zone_co2 - float(self.config.co2_target_ppm)
-        outdoor = float(outdoor_temperature(timestamp))
-        temp_slope = 0.0
-        if (
-            self.prev_env_timestamp is not None
-            and self.prev_outdoor_temp is not None
-        ):
-            dt_hours = max((timestamp - self.prev_env_timestamp).total_seconds() / 3600.0, 1e-6)
-            temp_slope = (outdoor - self.prev_outdoor_temp) / dt_hours
-        self.prev_outdoor_temp = outdoor
-        self.prev_env_timestamp = timestamp
-        minute = timestamp.hour * 60 + timestamp.minute
-        angle = 2.0 * math.pi * (minute / 1440.0)
-        sin_time = math.sin(angle)
-        cos_time = math.cos(angle)
-        obs = np.concatenate(
-            [
-                temp_error,
-                temp_delta,
-                co2_error,
-                co2_delta,
-                np.array(
-                    [
-                        outdoor,
-                        temp_slope,
-                        sin_time,
-                        cos_time,
-                    ],
-                    dtype=np.float32,
-                ),
-                self.prev_action.astype(np.float32),
-            ]
-        )
-        return np.nan_to_num(obs, nan=0.0)
+        # --- 外気温と予報（30分刻み×2step=1h間隔、6時間先までで12点） ---
+        def _norm_temp(val: float) -> float:
+            return float(np.clip(val / 40.0, -5.0, 5.0))
+
+        outdoor_now = _norm_temp(float(outdoor_temperature(timestamp)))
+        outdoor_forecast: list[float] = []
+        for i in range(1, 13):  # 1h〜12h? Wait 12 increments (6h, 30min*12=6h). Use 1h increments => i*60
+            future = timestamp + timedelta(minutes=30 * i)  # 30分刻みで12ステップ=6時間
+            outdoor_forecast.append(_norm_temp(float(outdoor_temperature(future))))
+
+        # --- CO2排出係数（現在+6時間先まで） ---
+        def _norm_factor(val: float) -> float:
+            return float(np.clip(val / 0.5, 0.0, 4.0))
+
+        co2_factor_now = _norm_factor(dynamic_co2_factor(timestamp))
+        co2_factor_forecast: list[float] = []
+        for i in range(1, 13):
+            future = timestamp + timedelta(minutes=30 * i)
+            co2_factor_forecast.append(_norm_factor(dynamic_co2_factor(future)))
+
+        # --- ゾーンごとの温度・設定温度差分 ---
+        def _norm_temp_centered(val: np.ndarray) -> np.ndarray:
+            return np.clip((val - 25.0) / 5.0, -5.0, 5.0)
+
+        temp_norm = _norm_temp_centered(zone_temps)
+        temp_error_norm = _norm_temp_centered(zone_temps - current_setpoints)
+
+        # 過去4ステップの設定温度履歴（最新が最後に来るように展開）
+        set_hist_arr = np.vstack(self.setpoint_history[-self.history_len :])
+        set_hist_flat = _norm_temp_centered(set_hist_arr).astype(np.float32).ravel()
+
+        prev_action_norm = _norm_temp_centered(current_setpoints.astype(np.float32))
+
+        zone_features: list[float] = []
+        for idx in range(zone_count):
+            zone_features.extend(
+                [
+                    temp_norm[idx],
+                    temp_error_norm[idx],
+                ]
+            )
+        obs_parts: list[np.ndarray | float] = [
+            np.array([time_feat], dtype=np.float32),
+            np.array([outdoor_now], dtype=np.float32),
+            np.asarray(outdoor_forecast, dtype=np.float32),
+            np.array([co2_factor_now], dtype=np.float32),
+            np.asarray(co2_factor_forecast, dtype=np.float32),
+            np.asarray(zone_features, dtype=np.float32),
+            set_hist_flat.astype(np.float32),
+            prev_action_norm.astype(np.float32),
+        ]
+
+        obs = np.concatenate(obs_parts)
+        return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
 
     def __call__(
@@ -552,30 +577,27 @@ class PolicyController:
         else:
             scaled_np = self.prev_action.copy()
 
-        scaled_tensor = torch.from_numpy(scaled_np.astype(np.float32, copy=False)).to(self.scaler.low.device)
-        tanh_action_tensor = self.scaler.unscale_action(scaled_tensor)
-        tanh_action = tanh_action_tensor.detach().cpu().numpy()
-        scaled_np = scaled_tensor.detach().cpu().numpy()
+        # 0.5℃刻みで量子化し、設定温度範囲にクリップ
+        quantized = np.round(scaled_np / float(self.config.setpoint_step)) * float(self.config.setpoint_step)
+        quantized = np.clip(quantized, self.config.setpoint_low, self.config.setpoint_high)
 
-        self.prev_action = scaled_np.copy()
+        quantized_tensor = torch.from_numpy(quantized.astype(np.float32, copy=False)).to(self.scaler.low.device)
+        tanh_quantized_tensor = self.scaler.unscale_action(quantized_tensor)
+        tanh_action = tanh_quantized_tensor.detach().cpu().numpy()
+
+        self.prev_action = quantized.copy()
         self.prev_tanh_action = tanh_action.copy()
+        self.setpoint_history.append(quantized.copy())
+        if len(self.setpoint_history) > self.history_len:
+            self.setpoint_history.pop(0)
 
         self.obs_history.append(obs_vec.astype(np.float32, copy=False))
-        self.action_history.append(scaled_np.astype(np.float32, copy=False))
+        self.action_history.append(quantized.astype(np.float32, copy=False))
         self.tanh_history.append(tanh_action.astype(np.float32, copy=False))
         self.timestamps.append(timestamp)
         self.decision_flags.append(bool(should_sample))
 
-        zone_act = np.clip(scaled_np[: self.zone_count], self.config.damper_min, self.config.damper_max)
-        oa = float(np.clip(scaled_np[self.zone_count], self.config.oa_min, self.config.oa_max))
-        coil = float(np.clip(scaled_np[self.zone_count + 1], self.config.coil_min, self.config.coil_max))
-        fan = float(np.clip(scaled_np[self.zone_count + 2], self.config.fan_min, self.config.fan_max))
-        return HVACActions(
-            zone_dampers=zone_act.tolist(),
-            oa_damper=oa,
-            coil_valve=coil,
-            fan_speed=fan,
-        )
+        return HVACActions(zone_setpoints=quantized.tolist())
 
     def trajectory(self) -> dict[str, np.ndarray | List[datetime]]:
 
@@ -602,18 +624,8 @@ def build_action_scaler(config: TrainingConfig) -> ActionScaler:
 
     """ゾーン数に応じたアクションスケーラを組み立てる。"""
     zone_count = len(config.zones)
-    low = np.concatenate(
-        [
-            np.full(zone_count, config.damper_min, dtype=np.float32),
-            np.array([config.oa_min, config.coil_min, config.fan_min], dtype=np.float32),
-        ]
-    )
-    high = np.concatenate(
-        [
-            np.full(zone_count, config.damper_max, dtype=np.float32),
-            np.array([config.oa_max, config.coil_max, config.fan_max], dtype=np.float32),
-        ]
-    )
+    low = np.full(zone_count, config.setpoint_low, dtype=np.float32)
+    high = np.full(zone_count, config.setpoint_high, dtype=np.float32)
     return ActionScaler(low=torch.from_numpy(low), high=torch.from_numpy(high))
 
 
@@ -648,6 +660,8 @@ def _load_weather_profiles(weather_dir: Path) -> List[tuple[Path, tuple[np.ndarr
 
     profiles: List[tuple[Path, tuple[np.ndarray, np.ndarray, np.ndarray]]] = []
     for path in sorted(weather_dir.glob("*.csv")):
+        if "solar" in path.name.lower():
+            continue  # skip solar helper file
         try:
             df = pd.read_csv(path)
             profiles.append((path, _prepare_weather_profile(df, path)))
@@ -772,59 +786,59 @@ def build_simulation_kwargs(config: TrainingConfig) -> dict:
         "fan_nominal_flow_m3_min": 100.0,
         "chw_pump_efficiency": 0.8,
         "setpoint": config.setpoint,
+        "setpoint_min": config.setpoint_low,
+        "setpoint_max": config.setpoint_high,
         "zone_pid_kp": 0.6,
         "zone_pid_ti": 25.0,
         "zone_pid_t_reset": 30,
         "zone_pid_t_step": 2,
         "hvac_start_hour": config.hvac_start_hour,
         "hvac_stop_hour": config.hvac_stop_hour,
+        "co2_target_ppm": config.co2_target_ppm,
+        "oa_frac_max": config.oa_max,
+        "force_weekday_occupancy": config.force_weekday_occupancy,
     }
 
 def compute_step_rewards(df: pd.DataFrame, config: TrainingConfig) -> tuple[np.ndarray, np.ndarray]:
 
     """シミュレーション結果から時系列報酬と学習対象マスクを作成する。"""
-    # --- 快適性評価: ガウス報酬と許容帯違反を算出 ---
     zone_temp_cols = sorted(col for col in df.columns if col.startswith("zone") and col.endswith("_temp"))
     temps = np.nan_to_num(df[zone_temp_cols].to_numpy(), nan=config.setpoint)
-    temp_error = temps - config.comfort_center
+    temp_df = pd.DataFrame(temps)
 
-    sigma = max(config.temp_sigma, 1e-3)
-    gaussian = np.exp(-0.5 * (temp_error / sigma) ** 2)
-    comfort_reward = gaussian.mean(axis=1)
+    # 作用温度を簡易推定：空気温度と1時間移動平均の平均
+    temp_ma = temp_df.rolling(window=60, min_periods=1).mean().to_numpy()
+    operative = 0.5 * (temps + temp_ma)
 
-    lower_violation = np.clip(config.comfort_low - temps, 0.0, None)
-    upper_violation = np.clip(temps - config.comfort_high, 0.0, None)
+    lower_violation = np.clip(config.comfort_low - operative, 0.0, None)
+    upper_violation = np.clip(operative - config.comfort_high, 0.0, None)
     band_violation = lower_violation + upper_violation
-    band_penalty = (band_violation ** 2).mean(axis=1)
+    comfort_penalty = (band_violation ** 2).mean(axis=1)
 
-    # --- エネルギー消費: ファン・ポンプ・チラー電力を合算 ---
-    power_kw = (
-        np.nan_to_num(df["fan_power_kw"].to_numpy(), nan=0.0)
-        + np.nan_to_num(df["chw_pump_power_kw"].to_numpy(), nan=0.0)
-        + np.nan_to_num(df["chiller_power_kw"].to_numpy(), nan=0.0)
-    )
+    # 温度変化ペナルティ（30分・60分）
+    ramp30 = temp_df.diff(periods=30).abs().sub(config.ramp_short_threshold).clip(lower=0.0) ** 2
+    ramp60 = temp_df.diff(periods=60).abs().sub(config.ramp_long_threshold).clip(lower=0.0) ** 2
+    ramp_penalty = pd.concat([ramp30, ramp60], axis=1).mean(axis=1).fillna(0.0).to_numpy()
 
-    # --- 室内CO2の罰則: ロジスティック関数と閾値超過を導入 ---
-    co2_cols = sorted(col for col in df.columns if col.startswith("zone") and col.endswith("_co2_ppm"))
-    if co2_cols:
-        zone_co2 = np.nan_to_num(df[co2_cols].to_numpy(), nan=config.co2_target_ppm)
-        peak_co2 = np.max(zone_co2, axis=1)
-        logistic_arg = np.clip(
-            (peak_co2 - config.co2_target_ppm) / max(config.co2_logistic_k, 1e-6),
-            -60.0,
-            60.0,
-        )
-        co2_penalty = 1.0 / (1.0 + np.exp(-logistic_arg))
-
-        # CO2濃度が1100ppmを超えた場合の大きなペナルティ（一定値）
-        co2_violation_mask = peak_co2 > config.co2_violation_threshold
-        co2_violation_penalty = np.where(co2_violation_mask, config.co2_violation_penalty, 0.0)
+    # 排出量（シミュレーションで計算済みを優先、無ければ再計算）
+    if "co2_emission_kg" in df.columns:
+        emission = np.nan_to_num(df["co2_emission_kg"].to_numpy(), nan=0.0)
     else:
-        peak_co2 = np.zeros(len(df), dtype=np.float32)
-        co2_penalty = np.zeros(len(df), dtype=np.float32)
-        co2_violation_penalty = np.zeros(len(df), dtype=np.float32)
+        if "power_total_kw" in df.columns:
+            power_kw = np.nan_to_num(df["power_total_kw"].to_numpy(), nan=0.0)
+        else:
+            power_kw = (
+                np.nan_to_num(df.get("fan_power_kw", pd.Series(0.0, index=df.index)).to_numpy(), nan=0.0)
+                + np.nan_to_num(df.get("chiller_power_kw", pd.Series(0.0, index=df.index)).to_numpy(), nan=0.0)
+                + np.nan_to_num(df.get("chw_pump_power_kw", pd.Series(0.0, index=df.index)).to_numpy(), nan=0.0)
+            )
+        factors = np.nan_to_num(
+            df.get("co2_factor_kg_per_kwh", pd.Series(0.0, index=df.index)).to_numpy(), nan=0.0
+        )
+        dt_hours = float(config.timestep_s) / 3600.0
+        emission = power_kw * factors * dt_hours
 
-    # --- HVAC稼働マスク: 実際に空調が動いている時間のみ報酬を付与 ---
+    # HVAC稼働マスク
     hvac_on_col = df.get("hvac_on")
     if hvac_on_col is not None:
         hvac_active_vals = np.nan_to_num(hvac_on_col.to_numpy(), nan=0.0)
@@ -832,17 +846,11 @@ def compute_step_rewards(df: pd.DataFrame, config: TrainingConfig) -> tuple[np.n
     else:
         hvac_active_mask = np.ones(len(df), dtype=bool)
 
-    reward = (
-        comfort_reward
-        - config.comfort_penalty * band_penalty
-        - config.power_weight * power_kw
-        - config.co2_penalty_weight * co2_penalty
-        - co2_violation_penalty
+    reward = -(
+        config.comfort_weight * comfort_penalty
+        + config.ramp_weight * ramp_penalty
+        + config.emission_weight * emission
     )
-
-    df["peak_co2_ppm"] = peak_co2
-    df["co2_penalty"] = co2_penalty
-    df["co2_violation_penalty"] = co2_violation_penalty
 
     # --- 時刻スケジュールと組み合わせて、学習対象となるステップを決定 ---
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -1015,8 +1023,9 @@ def train(config: TrainingConfig) -> None:
     config.zones = config.zones or build_default_zones()
 
     zone_count = len(config.zones)
-    action_dim = zone_count + 3
-    obs_dim = zone_count * 4 + 4 + action_dim
+    action_dim = zone_count  # 各ゾーンの設定温度のみ
+    # 観測次元: グローバル27（時間/外気/CO2係数とその予測） + per-zone(6) + 前回アクション(zone_count)
+    obs_dim = 27 + 7 * zone_count
 
     actor_hidden = tuple(config.hidden_sizes)
     critic_hidden = tuple(config.critic_hidden_sizes) if config.critic_hidden_sizes else actor_hidden
@@ -1052,7 +1061,7 @@ def train(config: TrainingConfig) -> None:
     if not log_path.exists():
         log_path.write_text(
             "episode,total_return,mean_reward,mean_temp_error,mean_power_kw,total_power_kwh,"
-            "mean_co2_ppm,max_co2_ppm,mean_co2_penalty\n"
+            "mean_co2_ppm,max_co2_ppm,total_co2_kg\n"
         )
 
     weather_profiles = _load_weather_profiles(config.weather_data_dir)
@@ -1294,19 +1303,11 @@ def train(config: TrainingConfig) -> None:
             else:
                 max_co2_ppm = 0.0
                 mean_co2_ppm = 0.0
-            co2_penalty_series = df["co2_penalty"].to_numpy()
-            co2_violation_penalty_series = df["co2_violation_penalty"].to_numpy()
-            if mask_np.any():
-                mean_co2_penalty = float(np.mean(co2_penalty_series[mask_np]))
-                mean_co2_violation_penalty = float(np.mean(co2_violation_penalty_series[mask_np]))
-            else:
-                mean_co2_penalty = float(np.mean(co2_penalty_series)) if co2_penalty_series.size else 0.0
-                mean_co2_violation_penalty = float(np.mean(co2_violation_penalty_series)) if co2_violation_penalty_series.size else 0.0
         else:
             max_co2_ppm = 0.0
             mean_co2_ppm = 0.0
-            mean_co2_penalty = 0.0
-            mean_co2_violation_penalty = 0.0
+        mean_co2_penalty = 0.0
+        mean_co2_violation_penalty = 0.0
 
 
 
@@ -1328,10 +1329,11 @@ def train(config: TrainingConfig) -> None:
 
         # --- CSVログへの書き出し ---
         if episode % config.log_interval == 0:
+            total_co2_kg = float(df["co2_emission_cum_kg"].iloc[-1]) if "co2_emission_cum_kg" in df.columns else 0.0
             with log_path.open("a") as fp:
                 fp.write(
                     f"{episode},{total_return:.4f},{mean_reward:.4f},{mean_temp_error:.4f},{mean_power:.4f},{total_power:.4f},"
-                    f"{mean_co2_ppm:.1f},{max_co2_ppm:.1f},{mean_co2_penalty:.4f}\n"
+                    f"{mean_co2_ppm:.1f},{max_co2_ppm:.1f},{total_co2_kg:.3f}\n"
                 )
 
         # コンソール出力（print_everyエピソードごと）
@@ -1343,7 +1345,7 @@ def train(config: TrainingConfig) -> None:
                 f"mean_temp_error={mean_temp_error:.3f} | within_25_27={band_ratio:.3f} | "
                 f"mean_power_kw={mean_power:.3f} | total_power_kwh={total_power:.3f} | q_loss={mean_q_loss:.4f} | "
                 f"pi_loss={mean_actor_loss:.4f} | alpha={current_alpha:.3f} (mean={mean_alpha:.3f}) | alpha_loss={mean_alpha_loss:.4f} | "
-                f"max_co2={max_co2_ppm:.1f}ppm | mean_co2={mean_co2_ppm:.1f}ppm | co2_penalty={mean_co2_penalty:.3f} | co2_violation_penalty={mean_co2_violation_penalty:.3f} | "
+                f"max_co2={max_co2_ppm:.1f}ppm | mean_co2={mean_co2_ppm:.1f}ppm | "
                 f"buffer={buffer_usage}/{config.replay_buffer_size} | env_steps={env_steps} | updates={total_updates}",
                 flush=True,
             )
